@@ -7,12 +7,13 @@ An SD card in the board's TF slot, mountable as a real network drive over WiFi.
 ![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.5.2-red)
 ![Bus](https://img.shields.io/badge/SD%20bus-SPI%20(1--bit)-yellow)
 ![WebDAV](https://img.shields.io/badge/WebDAV-class%202-blue)
-![Status](https://img.shields.io/badge/Windows-read%2Fwrite-brightgreen)
+![Transport](https://img.shields.io/badge/transport-HTTPS%20only-brightgreen)
+![Auth](https://img.shields.io/badge/auth-HTTP%20Basic-brightgreen)
 
-A minimal WebDAV server built directly on ESP-IDF's `esp_http_server` — no
+A minimal WebDAV server built directly on ESP-IDF's `esp_https_server` — no
 Arduino core, no third-party WebDAV library. Mounts as a real network drive on
-Windows with full read/write, verified by a byte-identical 910 KB round trip
-through Explorer.
+Windows over TLS with password authentication, verified by a byte-identical
+981 KB round trip through Explorer.
 
 ---
 
@@ -24,10 +25,11 @@ through Explorer.
 - [Setup](#setup)
 - [Build and flash](#build-and-flash)
 - [Mounting as a network drive](#mounting-as-a-network-drive)
+- [Troubleshooting](#troubleshooting)
 - [Verified results](#verified-results)
 - [How it works](#how-it-works)
+- [Security model](#security-model)
 - [Roadmap](#roadmap)
-- [Troubleshooting](#troubleshooting)
 - [Project structure](#project-structure)
 
 ---
@@ -39,12 +41,13 @@ On boot the firmware:
 1. Mounts the TF card over SPI at `/sdcard`
 2. Writes a small `test.md` to it
 3. Joins WiFi as a station
-4. Prints its IP address and starts a WebDAV server on port 80
+4. Prints its IP address and starts a WebDAV server on port 443
 
 Supported methods: `OPTIONS`, `PROPFIND`, `PROPPATCH`, `GET`, `HEAD`, `PUT`,
 `DELETE`, `MKCOL`, `MOVE`, `LOCK`, `UNLOCK`. Announced as DAV class 2.
 
-`COPY` and `Depth: infinity` are not implemented.
+Everything is HTTPS-only and behind HTTP Basic authentication. `COPY` and
+`Depth: infinity` are not implemented.
 
 ## Hardware
 
@@ -67,13 +70,14 @@ documented pins:
 | MISO   | 3    |
 | SCK    | 2    |
 
-The boot log settles the question empirically — `sdmmc_card_print_info()` reports
+The boot log settles it empirically — `sdmmc_card_print_info()` reports
 `SSR: bus_width=1`, confirming single-bit SPI.
 
 ## Requirements
 
 - **ESP-IDF v5.5.2** (earlier 5.x will likely work but is untested here)
 - A TF card formatted **FAT32** — not exFAT
+- Python `cryptography` (already present in the ESP-IDF Python environment)
 
 > [!IMPORTANT]
 > Windows formats cards above 32 GB as exFAT by default. The mount config sets
@@ -83,31 +87,52 @@ The boot log settles the question empirically — `sdmmc_card_print_info()` repo
 
 ## Setup
 
-WiFi credentials are kept out of version control. Copy the template and fill in
-your own network:
+### 1. Credentials
+
+Copy the template and fill in your own values:
 
 ```bash
 copy main\wifi_credentials.h.example main\wifi_credentials.h
 ```
 
-Then edit `main/wifi_credentials.h`:
-
 ```c
 #define WIFI_SSID     "your-network-name"
-#define WIFI_PASSWORD "your-password"
+#define WIFI_PASSWORD "your-wifi-password"
+#define WEBDAV_USER   "your-webdav-username"
+#define WEBDAV_PASS   "your-webdav-password"
 ```
 
 If the file is missing, the build fails with an explicit `#error` rather than a
 confusing undefined-symbol error.
 
-> [!WARNING]
-> `build/` is gitignored **for security, not just tidiness**. The linked firmware
-> image contains your WiFi password as a plain string — `strings` on the `.bin`
-> will print it. Never commit `build/`, and never hand someone a prebuilt `.bin`
-> of this firmware.
-
 The board joins as a 2.4 GHz station. If your router broadcasts a separate
 5 GHz-only SSID, use the 2.4 GHz one.
+
+### 2. TLS certificates
+
+Generate the keypair. Pass the board's IP and your LAN's subnet:
+
+```bash
+python tools/gencert.py main/certs 192.168.1.42 192.168.1.0/24
+```
+
+This writes four files into `main/certs/` (all gitignored):
+
+| File | Role |
+| :--- | :--- |
+| `ca.crt` | The certificate authority. **This is the one you install on client machines.** |
+| `ca.key` | The CA's key. Never leaves your machine, never goes on the board. |
+| `server.crt` | Leaf + CA chain, embedded in the firmware. |
+| `server.key` | The leaf's key, embedded in the firmware. Cannot sign anything. |
+
+Why two certificates rather than one self-signed cert is explained under
+[Security model](#security-model). It matters more than it looks.
+
+> [!WARNING]
+> `build/` is gitignored **for security, not tidiness**. The linked firmware
+> image contains your WiFi password, your WebDAV password and the TLS private
+> key as plain data. Never commit `build/`, and never hand anyone a prebuilt
+> `.bin` of this firmware.
 
 ## Build and flash
 
@@ -133,39 +158,279 @@ delete `sdkconfig` and rebuild after editing them.
 
 ## Mounting as a network drive
 
-Take the IP address from the boot log.
+Take the IP address from the boot log. Examples below use `<board-ip>`.
+
+### Step 1 — trust the CA (once per client machine)
+
+Because the certificate is issued by your own CA rather than a public one,
+**every machine that mounts the drive must be told to trust `ca.crt` first.**
+There is no way around this short of owning a public domain name. Windows will
+refuse to mount with `System error 1790` until you do.
+
+**Windows** — in an **Administrator** prompt:
+
+```bash
+certutil -addstore -f "Root" path\to\ca.crt
+```
+
+To undo:
+
+```bash
+certutil -delstore "Root" "thumb-nas local CA"
+```
+
+Install **`ca.crt`**, not `server.crt`.
+
+### Step 2 — mount
+
+**Windows**, in a normal prompt:
+
+```bash
+net use Z: https://<board-ip>/ /user:your-webdav-username your-webdav-password
+```
+
+Omit the credentials to be prompted for them instead:
+
+```bash
+net use Z: https://<board-ip>/ *
+```
+
+Via the GUI: *This PC* → *Map Network Drive* → `https://<board-ip>/` → tick
+**Connect using different credentials** → enter the `WEBDAV_USER` /
+`WEBDAV_PASS` pair from `wifi_credentials.h`. It is **not** your Windows login
+and not your WiFi password.
+
+Windows maps this internally to `\\<board-ip>@SSL\DavWWWRoot`. Browsing,
+reading, writing, creating folders, renaming and deleting all work.
+
+To disconnect:
+
+```bash
+net use Z: /delete
+```
 
 ### Linux
 
-```bash
-gio mount dav://<board-ip>/
-```
+> [!NOTE]
+> **Not tested.** No Linux machine was reachable during development, so the
+> commands below are written from the protocol behaviour rather than confirmed
+> on hardware. They are the conventional invocations and the server implements
+> everything they need, but treat them as untested until someone runs them.
 
-Or GNOME Files → *Other Locations* → *Connect to Server* → `dav://<board-ip>/`.
-For a system-wide mount with davfs2:
-
-```bash
-sudo mount -t davfs http://<board-ip>/ /mnt/thumbnas
-```
-
-### Windows
+Trusting the CA, on Debian/Ubuntu:
 
 ```bash
-net use Z: http://<board-ip>/
+sudo cp ca.crt /usr/local/share/ca-certificates/thumb-nas.crt && sudo update-ca-certificates
 ```
 
-Or *This PC* → *Map Network Drive* → `http://<board-ip>/`.
+GNOME Files → *Other Locations* → *Connect to Server* → `davs://<board-ip>/`
+(note `davs`, not `dav` — the `s` selects TLS). Or:
 
-Windows maps this internally to `\\<board-ip>\DavWWWRoot`. Browsing, reading,
-writing, creating folders, renaming and deleting all work.
+```bash
+gio mount davs://<board-ip>/
+```
+
+With davfs2, which prompts for the username and password:
+
+```bash
+sudo mount -t davfs https://<board-ip>/ /mnt/thumbnas
+```
+
+### macOS / iOS / Android
+
+Also untested. All of them require the CA to be installed as a profile first,
+and iOS additionally requires manually enabling it under *Settings → General →
+About → Certificate Trust Settings* — installing the profile alone is not
+enough there.
+
+### Without mounting
+
+Any HTTPS client works against any path:
+
+```bash
+curl --cacert ca.crt -u your-webdav-username https://<board-ip>/test.md
+```
+
+On Windows PowerShell use `curl.exe`, not `curl` — the latter is an alias for
+`Invoke-WebRequest`, which takes different arguments. See the revocation note in
+[Troubleshooting](#troubleshooting) if that fails.
+
+## Troubleshooting
+
+### "The certificate is not trusted" / `System error 1790`
+
+The CA has not been installed on that machine. See
+[Step 1](#step-1--trust-the-ca-once-per-client-machine). This is the single most
+likely first-time snag, and Windows' phrasing — *"The network logon failed"* —
+gives no hint that certificates are involved.
+
+Verify the CA is present:
+
+```bash
+certutil -store "Root" "thumb-nas local CA"
+```
+
+### curl fails with `CRYPT_E_NO_REVOCATION_CHECK` even after trusting the CA
+
+**This one is expected, and the mount still works.** Windows' schannel tries to
+check whether the certificate has been revoked, which requires a CRL or OCSP
+endpoint. A private CA publishes neither, so the check cannot complete and curl
+treats that as fatal:
+
+```
+schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK
+(0x80092012) - The revocation function was unable to check revocation
+```
+
+Add `--ssl-no-revoke`:
+
+```bash
+curl --ssl-no-revoke -u your-webdav-username https://<board-ip>/test.md
+```
+
+Windows' WebClient service — the thing behind `net use` — is *less* strict here
+than curl and mounts without complaint. So this affects command-line testing
+only, not the drive itself.
+
+### Mount succeeds but the drive is unreachable later
+
+Check the IP in the boot log. A DHCP lease change invalidates an existing
+mapping while leaving it listed in `net use`, and the leaf certificate pins the
+IP it was issued for. Remove and re-add the mapping:
+
+```bash
+net use Z: /delete
+```
+
+If the address changed, regenerate the leaf for the new one — the CA covers the
+whole subnet, so it is one command and no re-trusting:
+
+```bash
+python tools/gencert.py main/certs <new-ip> 192.168.1.0/24
+```
+
+### Filenames appear as `KART_2~1.CSV`
+
+FAT long filename support is off. It is enabled via `CONFIG_FATFS_LFN_HEAP` in
+`sdkconfig.defaults`; delete `sdkconfig` and rebuild so the defaults are picked
+up.
+
+### `Failed to mount filesystem. Card may need FAT32 formatting.`
+
+The card is exFAT or has no partition table. Reformat as FAT32.
+
+### `idf.py` not found
+
+The ESP-IDF environment is not active. On Windows:
+
+```bash
+C:\Espressif\frameworks\esp-idf-v5.5.2\export.ps1
+```
+
+### `tool xtensa-esp-elf has no installed versions`
+
+Toolchains are present but at versions a different IDF release installed:
+
+```bash
+python.exe C:\Espressif\frameworks\esp-idf-v5.5.2\tools\idf_tools.py install
+```
+
+### Build fails with `-Werror=format-truncation`
+
+IDF compiles with that enabled. Use the bounded `path_join` / `str_copy` helpers
+in `webdav.c` rather than `snprintf("%s/%s", ...)` between two same-sized
+buffers.
+
+## Verified results
+
+Recorded from real hardware, not expected values.
+
+### Hardware and network
+
+| Check | Result |
+| :---- | :----- |
+| SD card mounts | PASS — SanDisk SC16G, SDHC, 15193 MB |
+| Bus width | 1-bit SPI at 20 MHz (confirms SPI, not SDMMC) |
+| WiFi association | PASS — WPA2-PSK, RSSI −66 dBm, channel 10 |
+| DHCP lease | PASS — but the address moved between reboots |
+
+### WebDAV verb matrix (curl, over HTTPS)
+
+| Method | Case | Expected | Result |
+| :----- | :--- | :------- | :----- |
+| OPTIONS | any path | 200 + `DAV: 1,2` | PASS |
+| MKCOL | new collection | 201 | PASS |
+| MKCOL | already exists | 405 | PASS |
+| PUT | new file | 201 | PASS |
+| PUT | overwrite | 204 | PASS |
+| GET | existing / missing | 200 / 404 | PASS |
+| PROPFIND | `Depth: 1` | 207 + well-formed XML | PASS |
+| MOVE | new / existing target | 201 / 204 | PASS |
+| DELETE | file / missing / recursive | 204 / 404 / 204 | PASS |
+| LOCK | new path | 201 + `Lock-Token` | PASS |
+| UNLOCK | — | 204 | PASS |
+
+PROPFIND XML was validated with a real XML parser, not eyeballed — malformed
+multistatus is the most common reason a client silently refuses to mount.
+
+### Authentication
+
+| Case | Result |
+| :--- | :----- |
+| No `Authorization` header | 401 + `WWW-Authenticate: Basic realm="Keychain NAS"` |
+| Wrong password | 401 |
+| Wrong username | 401 |
+| Correct, across PROPFIND / PUT / GET / DELETE | 207 / 201 / 200 / 204 |
+
+### Certificate chain
+
+| Test | Result |
+| :--- | :----- |
+| Validate by IP against `ca.crt` | 200 |
+| Validate by `keychain-nas.local` | 200 |
+| Validate for a name **outside** the CA's constraints | **rejected** |
+
+That last row is the point of the two-cert design — the CA cannot vouch for
+anything beyond its permitted subtrees, and this was confirmed rather than
+assumed.
+
+### Real client mounts
+
+| Client | Browse | Read | Write | Notes |
+| :----- | :----- | :--- | :---- | :---- |
+| curl (HTTPS) | ✅ | ✅ | ✅ | needs `--ssl-no-revoke` on Windows |
+| Windows `net use` (HTTPS) | ✅ | ✅ | ✅ | after trusting `ca.crt` |
+| Linux gvfs / davfs2 | — | — | — | **not tested, no machine available** |
+
+A 981 824-byte firmware binary copied through the Windows HTTPS mount came back
+**SHA-256 identical** (`E078A671…62D1`). Throughput ≈ 84 KB/s over TLS, against
+≈ 105 KB/s over plain HTTP — the gap is TLS overhead on top of the 1-bit SPI SD
+bus, which is the real ceiling.
+
+## How it works
+
+ESP-IDF supports WebDAV cleanly without any external library. Everything was
+verified in the IDF source before code was written:
+
+| Assumption | Verified at |
+| :--------- | :---------- |
+| `httpd_method_t` exposes WebDAV verbs | `esp_http_server.h:115` — a direct `typedef enum http_method` |
+| The verbs exist in the parser | `http_parser.h:105-115` — `COPY`=8, `LOCK`=9, `MKCOL`=10, `MOVE`=11, `PROPFIND`=12, `PROPPATCH`=13, `UNLOCK`=15 |
+| Custom verbs are not filtered out | `httpd_parse.c:69` — rejects only `method < 0` |
+| TLS config field names | `esp_https_server.h:74` — `servercert` (**not** `cacert_pem`, which older docs show), and `httpd_config_t` nested as `.httpd` |
+
+One handler is registered per method against the URI `/*`, with
+`config.httpd.uri_match_fn = httpd_uri_match_wildcard`. There is no global
+pre-handler hook in this IDF version, so each handler opens with a
+`DAV_REQUIRE_AUTH` guard.
+
+The commonly suggested ESPWebDAV library was deliberately not used — it lists
+ESP8266 as its primary target, not ESP32.
 
 ### What Windows actually required
 
-Worth recording, because the failure modes were misleading and the error
-messages actively point the wrong way.
-
-Windows needs **three** verbs beyond the obvious set, and omitting any of them
-fails in a way that looks like something else entirely:
+Worth recording, because the failure modes were misleading. Windows needs three
+verbs beyond the obvious set:
 
 | Verb | Symptom when missing |
 | :--- | :------------------- |
@@ -186,224 +451,134 @@ I (14041) webdav: DELETE /size_1.bin                 <- Windows rolls it back
 ```
 
 The file transfers completely, then Windows fails to stamp its timestamps,
-decides the copy failed, and deletes what it just wrote. The "network name is no
-longer available" message is Windows describing its own rollback — nothing about
-the network was wrong.
+decides the copy failed, and deletes what it just wrote.
 
-This also explains a confusing intermediate result: `[System.IO.File]::WriteAllText`
-succeeded while `Copy-Item` failed, because only the latter preserves file times
-and therefore triggers `PROPPATCH`.
+### Hidden files
 
-> [!NOTE]
-> `LOCK`/`UNLOCK` are a **stub**. They return a well-formed synthetic token
-> without tracking ownership, enforcing locks, or expiring them — enough for the
-> Windows redirector, which never verifies the token means anything. Two clients
-> writing the same file concurrently will still race. Acceptable for a
-> single-user pocket drive; not a general-purpose implementation.
->
-> `PROPPATCH` likewise acknowledges without persisting. File contents are
-> correct; client-supplied timestamps are dropped in favour of the card's own
-> mtime.
+PROPFIND omits `System Volume Information`, `$RECYCLE.BIN`, `desktop.ini`,
+`Thumbs.db`, `.DS_Store` and AppleDouble `._*` files from listings.
 
-Linux's gvfs and davfs2 require neither `LOCK` nor `PROPPATCH` and should mount
-read/write, but this has **not been tested on hardware**.
+This is a **display filter, not access control**. Those paths can still be
+created, read and deleted by explicit request — which matters, because Windows
+and macOS actively write some of them and would break if the writes were
+refused.
 
-### Without mounting
+## Security model
 
-Any HTTP client works against any path on the card:
+What this protects against, and what it does not.
 
-```bash
-curl http://<board-ip>/test.md
-```
+**Transport is TLS-only.** There is no plain-HTTP listener. Basic auth sends
+credentials as base64, which is reversible, so it is only defensible underneath
+TLS.
 
-On Windows PowerShell use `curl.exe`, not `curl` — the latter is an alias for
-`Invoke-WebRequest`, which takes different arguments.
+**The certificate is a two-cert chain, deliberately.** A single self-signed
+certificate has to be marked `CA=TRUE` to be trusted, and installing that into a
+machine's root store makes it a full certificate authority there. Its private
+key ships in the board's flash, recoverable by anyone who can read the chip over
+USB — so a stolen board would yield a key able to impersonate *any* HTTPS site
+to every machine that trusted it.
 
-## Verified results
+`nameConstraints` cannot fix that on a single certificate: per RFC 5280 the
+extension binds *subordinate* certificates, not the one carrying it, so a
+self-signed leaf is not constrained by its own extension.
 
-Recorded from real hardware, not expected values.
+Splitting them does fix it:
 
-### Hardware and network
+- `ca.key` never leaves your machine and never goes near the board
+- the CA carries a critical `nameConstraints` limited to `keychain-nas.local`
+  and your subnet
+- the leaf on the board is `CA=FALSE` and cannot sign anything
 
-| Check | Result |
-| :---- | :----- |
-| SD card mounts | PASS — SanDisk SC16G, SDHC, 15193 MB |
-| Bus width | 1-bit SPI at 20 MHz (confirms SPI, not SDMMC) |
-| WiFi association | PASS — WPA2-PSK, RSSI −66 dBm, channel 10 |
-| DHCP lease | PASS — but the address moved between reboots |
+A dumped board therefore yields a key that can impersonate one hostname on one
+subnet, not your bank. This was tested, not assumed — see
+[Certificate chain](#certificate-chain).
 
-### WebDAV verb matrix (via curl)
+### Known weaknesses
 
-| Method | Case | Expected | Result |
-| :----- | :--- | :------- | :----- |
-| OPTIONS | any path | 200 + `DAV: 1` | PASS |
-| MKCOL | new collection | 201 | PASS |
-| MKCOL | already exists | 405 | PASS |
-| PUT | new file | 201 | PASS |
-| PUT | overwrite | 204 | PASS |
-| GET | existing file | 200 | PASS |
-| GET | missing file | 404 | PASS |
-| PROPFIND | `Depth: 1` | 207 + well-formed XML | PASS |
-| MOVE | to new name | 201 | PASS |
-| MOVE | onto existing target | 204 | PASS |
-| DELETE | file | 204 | PASS |
-| DELETE | missing | 404 | PASS |
-| DELETE | folder, recursive | 204 | PASS |
-
-PROPFIND XML was validated with a real XML parser, not eyeballed — malformed
-multistatus is the most common reason a client silently refuses to mount.
-
-### Real client mounts
-
-| Client | Browse | Read | Create folder | Rename | Delete | Write file |
-| :----- | :----- | :--- | :------------ | :----- | :----- | :--------- |
-| curl | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Windows `net use` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux gvfs / davfs2 | not tested on hardware | | | | | |
-
-Integrity check: a 910 896-byte firmware binary copied through the Windows mount
-came back **SHA-256 identical** (`AF1653C4…87CF4`), and survived a subsequent
-move into a subdirectory intact. Throughput was roughly 105 KB/s, consistent
-between curl and Explorer — that is the 1-bit SPI SD bus, not the network.
-
-`VER-FRM-01`: **PASS** on Windows. WebDAV works on ESP32-S3 as a genuine
-mountable network drive, which retires `RISK-FRM-01`. Linux remains unverified
-only because no Linux machine was reachable during testing.
-
-## How it works
-
-ESP-IDF turns out to support WebDAV cleanly without any external library. Three
-things were verified in the IDF source before a line was written:
-
-| Assumption | Verified at |
-| :--------- | :---------- |
-| `httpd_method_t` exposes WebDAV verbs | `esp_http_server.h:115` — a direct `typedef enum http_method`, no subsetting |
-| The verbs exist in the parser | `http_parser.h:105-115` — `COPY`=8, `LOCK`=9, `MKCOL`=10, `MOVE`=11, `PROPFIND`=12, `UNLOCK`=15 |
-| Custom verbs are not filtered out | `httpd_parse.c:69` — rejects only `method < 0`; no whitelist, no upper bound |
-
-One handler is registered per method against the URI `/*`, with
-`httpd_config_t.uri_match_fn = httpd_uri_match_wildcard` so a single handler per
-verb serves any path.
-
-The commonly suggested ESPWebDAV library was deliberately not used — it lists
-ESP8266 as its primary target, not ESP32.
+- **Locking is a stub.** `LOCK`/`UNLOCK` return a well-formed synthetic token
+  without tracking ownership or expiry. Enough for the Windows redirector, which
+  never verifies the token means anything. Two clients writing the same file
+  concurrently will still race.
+- **`PROPPATCH` acknowledges without persisting.** File contents are correct;
+  client-supplied timestamps are dropped in favour of the card's own mtime.
+- **One shared credential pair**, compiled into the firmware. No per-user
+  accounts, no rotation without a reflash.
+- **No brute-force protection.** Nothing rate-limits failed logins.
+- **Data at rest is unencrypted.** Anyone holding the physical card reads
+  everything; TLS protects the wire only.
 
 ## Roadmap
 
-Known limitations, deliberately deferred. Each is separate work rather than
-something to fold into the current milestone.
-
-### Real locking, if more than one client ever writes
-
-`LOCK`/`UNLOCK` and `PROPPATCH` are stubs (see
-[What Windows actually required](#what-windows-actually-required)). They unblock
-Windows but enforce nothing. If this ever serves more than one writer, they need
-real state: a lock table with tokens, owners and timeouts, enforced on
-`PUT`/`DELETE`/`MOVE`, and `PROPPATCH` persisting timestamps via `utime()`.
-
 ### Flash size is misconfigured — 2 MB of 32 MB usable
 
-The board has 32 MB of flash but the build is configured for 2 MB, so roughly
-30 MB is unreachable. The bootloader reports this every boot:
+**The most urgent item.** The board has 32 MB of flash but the build is
+configured for 2 MB, so roughly 30 MB is unreachable. The bootloader says so
+every boot:
 
 ```
 W (355) spi_flash: Detected size(32768k) larger than the size in the
 binary image header(2048k). Using the size in the binary image header.
 ```
 
-The app partition is a single 1 MB and now sits at **87% full** (`0x219d0 bytes
-(13%) free`) after adding WebDAV. Adding mDNS and AP-mode fallback on top of
-that will hit the ceiling. This is the next thing worth doing.
+The app partition is a single 1 MB and now sits at **94% full** (`0x104c0
+bytes, 6% free`) after TLS and auth. The next feature of any size will not link.
 
 **Fix:** `idf.py menuconfig` → *Serial flasher config* → *Flash size* → 32 MB,
 plus a custom partition table.
 
 ### The IP address is not stable
 
-This is not theoretical — it happened during testing. The board came up as
-`<board-ip>`, and after a reset the lease moved to `<board-ip>`, silently
-invalidating an already-established `net use` mapping. Every bookmark and mount
-command breaks the same way.
+Not theoretical — it happened during development. The board came up on one
+address, and after a reset the lease moved, silently invalidating an established
+`net use` mapping. The leaf certificate also pins the IP in its SAN, so a lease
+change breaks TLS validation by address too.
 
-**Fix:** mDNS, so the board answers to `thumbnas.local` regardless of address. A
-DHCP reservation on the router is a stopgap that only helps on one network.
+**Fix:** mDNS, so the board answers to `keychain-nas.local` regardless of
+address — which is already the certificate's primary SAN, so trust survives the
+move. A DHCP reservation is a stopgap that helps on one network only.
 
-### No access when away from a known network
+### No access away from a known network
 
-Station mode needs an access point to join. Away from home there is none.
+Station mode needs an access point to join.
 
-- **Phone hotspot** — a one-line SSID change. Every device must join the hotspot;
-  the phone acts as router and devices keep internet via cellular.
+- **Phone hotspot** — a one-line SSID change; the phone acts as router and
+  devices keep internet via cellular.
 - **SoftAP** — the board becomes the access point. Right answer for a pocket NAS
   with no infrastructure. Two catches: it hands out no internet, and iOS notices
   this and may silently fall back to cellular unless told to stay.
 
 **Planned:** APSTA with fallback — try the known network for ~10 s at boot, bring
-up its own AP if that fails. With mDNS the address stays the same in both modes.
+up its own AP if that fails. With mDNS the address stays stable in both modes.
 
-### Not addressed at all
+### Smaller items
 
-- **No authentication.** Anyone on the network can read, write and delete the
-  entire card. Fine on a trusted LAN, not fine on a hotspot in public.
-- **No HTTPS.** Traffic is plaintext.
-- **`COPY` and `Depth: infinity`** are unimplemented. Windows does not appear to
-  need either for normal Explorer use.
-
-## Troubleshooting
-
-**`idf.py` not found** — the ESP-IDF environment is not active. On Windows:
-
-```bash
-C:\Espressif\frameworks\esp-idf-v5.5.2\export.ps1
-```
-
-**`tool xtensa-esp-elf has no installed versions`** — toolchains are present but
-at versions a different IDF release installed. Repair with:
-
-```bash
-python.exe C:\Espressif\frameworks\esp-idf-v5.5.2\tools\idf_tools.py install
-```
-
-**Filenames appear as `KART_2~1.CSV`** — FAT long filename support is off. It is
-enabled via `CONFIG_FATFS_LFN_HEAP` in `sdkconfig.defaults`; delete `sdkconfig`
-and rebuild so the defaults are picked up.
-
-**`Failed to mount filesystem. Card may need FAT32 formatting.`** — the card is
-exFAT or has no partition table. Reformat as FAT32.
-
-**`Failed to connect ... check SSID/password`** — the board retries 10 times then
-gives up. Check `main/wifi_credentials.h`, and confirm the SSID is 2.4 GHz.
-
-**Windows mount succeeds but the drive is empty or unreachable** — check the IP
-in the boot log. A DHCP lease change invalidates an existing mapping while
-leaving it listed in `net use`. Remove and re-add it:
-
-```bash
-net use Z: /delete
-```
-
-**Build fails with a `-Werror=format-truncation` error** — IDF compiles with that
-enabled. Use the bounded `path_join` / `str_copy` helpers in `webdav.c` rather
-than `snprintf("%s/%s", ...)` between two same-sized buffers.
+- Real lock state, if more than one client ever writes
+- `PROPPATCH` persisting timestamps via `utime()`
+- `COPY` and `Depth: infinity` (Windows appears not to need either)
+- Verifying the Linux mount path on actual hardware
 
 ## Project structure
 
 ```
 thumb-nas/
 ├── CMakeLists.txt                     Top-level IDF project file
-├── sdkconfig.defaults                 Tracked build settings (FAT LFN, HTTP limits)
-├── .gitignore                         Excludes credentials and build output
+├── sdkconfig.defaults                 Tracked build settings (FAT LFN, HTTPS)
+├── .gitignore                         Excludes credentials, certs, build output
 ├── README.md
+├── tools/
+│   └── gencert.py                     Generates the constrained CA and leaf
 └── main/
-    ├── CMakeLists.txt                 Component registration and requirements
+    ├── CMakeLists.txt                 Component registration, EMBED_TXTFILES
     ├── main.c                         SD mount, WiFi, startup
-    ├── webdav.c                       WebDAV method handlers
+    ├── webdav.c                       Auth, WebDAV handlers, TLS server start
     ├── webdav.h
-    ├── wifi_credentials.h             Your credentials — gitignored
+    ├── certs/                         Generated TLS material — gitignored
+    ├── wifi_credentials.h             Your secrets — gitignored
     └── wifi_credentials.h.example     Tracked template
 ```
 
 ## Acknowledgements
 
 Built from Espressif's official examples: `storage/sd_card/sdspi`,
-`wifi/getting_started/station`, and the `esp_http_server` component.
+`wifi/getting_started/station`, and the `esp_http_server` /
+`esp_https_server` components.

@@ -11,6 +11,12 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_https_server.h"
+#include "mbedtls/base64.h"
+#include "wifi_credentials.h"
+
+#if !defined(WEBDAV_USER) || !defined(WEBDAV_PASS)
+#error "Missing WebDAV credentials -- add WEBDAV_USER and WEBDAV_PASS to main/wifi_credentials.h (see the .example)."
+#endif
 
 static const char *TAG = "webdav";
 
@@ -19,6 +25,103 @@ static const char *TAG = "webdav";
 
 /* Filesystem root this server exposes, e.g. "/sdcard". */
 static char s_base_path[64];
+
+/* ---------------------------------------------------------------------------
+   HTTP Basic authentication
+
+   esp_http_server has no global pre-handler hook in this IDF version --
+   open_fn fires per connection, not per request, and uri_match_fn sees no
+   headers. So every handler guards itself with DAV_REQUIRE_AUTH.
+
+   Basic auth is base64, not encryption. This is only defensible because the
+   server is HTTPS-only; over plain HTTP the password would be readable on the
+   wire by anyone.
+   --------------------------------------------------------------------------- */
+
+/* Length-independent comparison, so response time does not leak how many
+   leading characters of the password were correct. */
+static bool secure_equals(const char *a, const char *b)
+{
+  size_t la = strlen(a), lb = strlen(b);
+  unsigned char diff = (unsigned char)(la ^ lb);
+  size_t n = la < lb ? la : lb;
+  for (size_t i = 0; i < n; i++) {
+    diff |= (unsigned char)(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+static esp_err_t send_401(httpd_req_t *req)
+{
+  httpd_resp_set_status(req, "401 Unauthorized");
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Keychain NAS\"");
+  httpd_resp_send(req, NULL, 0);
+  return ESP_OK;  /* a valid HTTP response, not a server error */
+}
+
+static bool check_auth(httpd_req_t *req)
+{
+  size_t hlen = httpd_req_get_hdr_value_len(req, "Authorization");
+  if (hlen == 0 || hlen > 256) {
+    send_401(req);
+    return false;
+  }
+
+  char hdr[264];
+  if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) {
+    send_401(req);
+    return false;
+  }
+
+  if (strncasecmp(hdr, "Basic ", 6) != 0) {
+    send_401(req);
+    return false;
+  }
+
+  const char *b64 = hdr + 6;
+  while (*b64 == ' ') {
+    b64++;
+  }
+
+  unsigned char decoded[192];
+  size_t olen = 0;
+  if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &olen,
+                            (const unsigned char *)b64, strlen(b64)) != 0) {
+    send_401(req);
+    return false;
+  }
+  decoded[olen] = '\0';
+
+  /* "user:pass" -- the password may itself contain ':', so split on the first
+     one only. */
+  char *sep = strchr((char *)decoded, ':');
+  if (!sep) {
+    send_401(req);
+    return false;
+  }
+  *sep = '\0';
+  const char *user = (const char *)decoded;
+  const char *pass = sep + 1;
+
+  bool ok = secure_equals(user, WEBDAV_USER) && secure_equals(pass, WEBDAV_PASS);
+
+  /* Scrub the decoded credentials off the stack rather than leaving them for
+     whatever reuses this frame. */
+  memset(decoded, 0, sizeof(decoded));
+
+  if (!ok) {
+    ESP_LOGW(TAG, "auth failed for %s", req->uri);
+    send_401(req);
+    return false;
+  }
+  return true;
+}
+
+/* One line per handler, since there is no global hook to register instead. */
+#define DAV_REQUIRE_AUTH(req)              \
+  do {                                     \
+    if (!check_auth(req)) return ESP_OK;   \
+  } while (0)
 
 /* ---------------------------------------------------------------------------
    URI <-> filesystem path helpers
@@ -175,6 +278,31 @@ static void str_copy(char *dst, size_t dst_len, const char *src)
   dst[n] = '\0';
 }
 
+/* OS housekeeping files that clutter a directory listing. This is a *display*
+   filter for PROPFIND only -- GET/PUT/DELETE on these paths still work if a
+   client asks for one by name, which matters because Windows and macOS
+   actively write some of them and would break if the writes were refused. */
+static bool is_hidden_junk(const char *name)
+{
+  static const char *exact[] = {
+      "System Volume Information",
+      "$RECYCLE.BIN",
+      "desktop.ini",
+      "Thumbs.db",
+      ".DS_Store",
+  };
+  for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
+    if (strcasecmp(name, exact[i]) == 0) {
+      return true;
+    }
+  }
+  /* AppleDouble sidecar files: "._" followed by the real filename. */
+  if (name[0] == '.' && name[1] == '_') {
+    return true;
+  }
+  return false;
+}
+
 /* RFC 1123 date, which is what getlastmodified must carry. */
 static void http_date(time_t t, char *out, size_t out_len)
 {
@@ -189,6 +317,8 @@ static void http_date(time_t t, char *out, size_t out_len)
 
 static esp_err_t dav_options_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   ESP_LOGI(TAG, "OPTIONS %s", req->uri);
 
   /* Class 2 announces LOCK/UNLOCK support, which Windows checks before it will
@@ -260,6 +390,8 @@ static esp_err_t send_response_block(httpd_req_t *req, const char *href_path,
 
 static esp_err_t dav_propfind_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -341,6 +473,9 @@ static esp_err_t dav_propfind_handler(httpd_req_t *req)
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
           continue;
         }
+        if (is_hidden_junk(ent->d_name)) {
+          continue;
+        }
 
         char child_fs[DAV_MAX_PATH];
         path_join(child_fs, sizeof(child_fs), fs_path, ent->d_name);
@@ -386,6 +521,8 @@ static esp_err_t dav_propfind_handler(httpd_req_t *req)
 
 static esp_err_t dav_get_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -443,6 +580,8 @@ static esp_err_t dav_get_handler(httpd_req_t *req)
 
 static esp_err_t dav_put_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -549,6 +688,8 @@ static bool remove_recursive(const char *path)
 
 static esp_err_t dav_delete_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -586,6 +727,8 @@ static esp_err_t dav_delete_handler(httpd_req_t *req)
 
 static esp_err_t dav_mkcol_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -645,6 +788,8 @@ static bool destination_to_fs(const char *dest, char *out, size_t out_len)
 
 static esp_err_t dav_move_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char src[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, src, sizeof(src))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -741,6 +886,8 @@ static bool discard_body(httpd_req_t *req)
 
 static esp_err_t dav_head_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -780,6 +927,8 @@ static esp_err_t dav_head_handler(httpd_req_t *req)
 
 static esp_err_t dav_proppatch_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -869,6 +1018,8 @@ static void make_lock_token(char *out, size_t out_len)
 
 static esp_err_t dav_lock_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   char fs_path[DAV_MAX_PATH];
   if (!uri_to_fs(req->uri, fs_path, sizeof(fs_path))) {
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid path");
@@ -950,6 +1101,8 @@ static esp_err_t dav_lock_handler(httpd_req_t *req)
 
 static esp_err_t dav_unlock_handler(httpd_req_t *req)
 {
+  DAV_REQUIRE_AUTH(req);
+
   if (!discard_body(req)) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
     return ESP_FAIL;
