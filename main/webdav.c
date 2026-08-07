@@ -12,6 +12,7 @@
 #include "esp_random.h"
 #include "esp_https_server.h"
 #include "mbedtls/base64.h"
+#include "esp_vfs_fat.h"
 #include "wifi_credentials.h"
 
 #if !defined(WEBDAV_USER) || !defined(WEBDAV_PASS)
@@ -572,6 +573,83 @@ static esp_err_t dav_get_handler(httpd_req_t *req)
   fclose(f);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+   GET /status -- free space
+
+   Registered before the wildcard GET handler, which matters:
+   httpd_find_uri_handler walks hd_calls[] in registration order and takes the
+   first match (httpd_uri.c:94), so a wildcard registered first would swallow
+   this.
+
+   Consequence worth knowing: a real file named /status on the card becomes
+   unreachable over GET, because this handler wins. It still appears in
+   PROPFIND listings and can still be deleted or moved.
+   --------------------------------------------------------------------------- */
+
+/* Render a byte count as e.g. "14.2 GB". Integer maths throughout -- avoids
+   pulling floating point into printf on a target where that is a config
+   option rather than a given. */
+static void human_bytes(uint64_t bytes, char *out, size_t out_len)
+{
+  const uint64_t KB = 1024ULL;
+  const uint64_t MB = KB * 1024ULL;
+  const uint64_t GB = MB * 1024ULL;
+
+  if (bytes >= GB) {
+    uint64_t tenths = (bytes * 10ULL) / GB;
+    snprintf(out, out_len, "%llu.%llu GB", tenths / 10ULL, tenths % 10ULL);
+  } else if (bytes >= MB) {
+    uint64_t tenths = (bytes * 10ULL) / MB;
+    snprintf(out, out_len, "%llu.%llu MB", tenths / 10ULL, tenths % 10ULL);
+  } else if (bytes >= KB) {
+    snprintf(out, out_len, "%llu KB", bytes / KB);
+  } else {
+    snprintf(out, out_len, "%llu bytes", bytes);
+  }
+}
+
+static esp_err_t dav_status_handler(httpd_req_t *req)
+{
+  DAV_REQUIRE_AUTH(req);
+
+  uint64_t total = 0, freeb = 0;
+  esp_err_t err = esp_vfs_fat_info(s_base_path, &total, &freeb);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_vfs_fat_info(%s) failed: %s", s_base_path, esp_err_to_name(err));
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot stat filesystem");
+    return ESP_FAIL;
+  }
+
+  uint64_t used = (total >= freeb) ? (total - freeb) : 0;
+
+  /* Percentage without floating point: one decimal place. */
+  uint64_t pct_tenths = total ? (used * 1000ULL) / total : 0;
+
+  char h_total[32], h_used[32], h_free[32];
+  human_bytes(total, h_total, sizeof(h_total));
+  human_bytes(used,  h_used,  sizeof(h_used));
+  human_bytes(freeb, h_free,  sizeof(h_free));
+
+  ESP_LOGI(TAG, "status: %s free of %s", h_free, h_total);
+
+  char body[512];
+  int len = snprintf(body, sizeof(body),
+                     "{\n"
+                     "  \"mount\": \"%s\",\n"
+                     "  \"total_bytes\": %llu,\n"
+                     "  \"used_bytes\": %llu,\n"
+                     "  \"free_bytes\": %llu,\n"
+                     "  \"used_percent\": %llu.%llu,\n"
+                     "  \"summary\": \"%s free of %s (%s used)\"\n"
+                     "}\n",
+                     s_base_path, total, used, freeb,
+                     pct_tenths / 10ULL, pct_tenths % 10ULL,
+                     h_free, h_total, h_used);
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, body, len);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1160,6 +1238,8 @@ httpd_handle_t webdav_start(const char *base_path)
   const httpd_uri_t handlers[] = {
       { .uri = "/*", .method = HTTP_OPTIONS,  .handler = dav_options_handler,  .user_ctx = NULL },
       { .uri = "/*", .method = HTTP_PROPFIND, .handler = dav_propfind_handler, .user_ctx = NULL },
+      /* Must precede the wildcard GET handler below -- first match wins. */
+      { .uri = "/status", .method = HTTP_GET, .handler = dav_status_handler,  .user_ctx = NULL },
       { .uri = "/*", .method = HTTP_GET,      .handler = dav_get_handler,      .user_ctx = NULL },
       { .uri = "/*", .method = HTTP_PUT,      .handler = dav_put_handler,      .user_ctx = NULL },
       { .uri = "/*", .method = HTTP_DELETE,   .handler = dav_delete_handler,   .user_ctx = NULL },

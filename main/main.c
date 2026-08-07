@@ -47,6 +47,7 @@
 #include "driver/sdspi_host.h"
 #include "webdav.h"
 #include "cacert_server.h"
+#include "discovery.h"
 
 static const char *TAG = "waveshare_test";
 
@@ -218,12 +219,22 @@ void app_main(void) {
     esp_netif_ip_info_t ip_info;
     esp_netif_get_ip_info(netif, &ip_info);
 
+    /* Before printing the URLs, so they can quote the hostname honestly. */
+    bool mdns_ok = (discovery_start() == ESP_OK);
+
     ESP_LOGI(TAG, "--------------------------------------------------");
-    ESP_LOGI(TAG, "STEP 1, get the certificate:  http://" IPSTR "/ca.crt", IP2STR(&ip_info.ip));
-    ESP_LOGI(TAG, "STEP 2, mount the drive:      net use Z: https://" IPSTR "/ *",
-             IP2STR(&ip_info.ip));
-    ESP_LOGI(TAG, "Or fetch a file directly:     curl --cacert ca.crt -u %s https://" IPSTR "/test.md",
-             WEBDAV_USER, IP2STR(&ip_info.ip));
+    if (mdns_ok) {
+      ESP_LOGI(TAG, "STEP 1, get the certificate:  http://%s/ca.crt", DISCOVERY_FQDN);
+      ESP_LOGI(TAG, "STEP 2, mount the drive:      net use Z: https://%s/ *", DISCOVERY_FQDN);
+      ESP_LOGI(TAG, "The name above survives DHCP changes. Current address is "
+                    IPSTR " if mDNS is blocked on your network.", IP2STR(&ip_info.ip));
+    } else {
+      ESP_LOGW(TAG, "mDNS unavailable -- falling back to the raw address, which");
+      ESP_LOGW(TAG, "will change when the DHCP lease does.");
+      ESP_LOGI(TAG, "STEP 1, get the certificate:  http://" IPSTR "/ca.crt", IP2STR(&ip_info.ip));
+      ESP_LOGI(TAG, "STEP 2, mount the drive:      net use Z: https://" IPSTR "/ *",
+               IP2STR(&ip_info.ip));
+    }
     ESP_LOGI(TAG, "--------------------------------------------------");
 
     /* Started regardless of the SD card: a client still needs the CA to reach

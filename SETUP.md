@@ -6,13 +6,27 @@ You need two things: the **certificate**, and the **login**. The certificate com
 from the device itself; the login is whatever `WEBDAV_USER` / `WEBDAV_PASS` were
 set to when the firmware was built.
 
-Everything below assumes you are on the same network as the device. Take its IP
-address from the boot log — it prints all of this on startup:
+The device advertises itself over mDNS as **`keychain-nas.local`**. Use that
+name rather than an IP address — the IP changes whenever DHCP reassigns it, and
+has done so repeatedly; the name does not. It prints both on startup:
 
 ```
-STEP 1, get the certificate:  http://<board-ip>/ca.crt
-STEP 2, mount the drive:      net use Z: https://<board-ip>/ *
+STEP 1, get the certificate:  http://keychain-nas.local/ca.crt
+STEP 2, mount the drive:      net use Z: https://keychain-nas.local/ *
+The name above survives DHCP changes. Current address is 192.168.x.x if
+mDNS is blocked on your network.
 ```
+
+> [!IMPORTANT]
+> **mDNS needs your client and the device on the same WiFi network — not just
+> the same router.** The ESP32-S3 has no 5 GHz radio, so it is always on the
+> 2.4 GHz SSID. If your laptop is on a separate 5 GHz SSID, many routers will
+> route ordinary traffic between them but *not* forward the multicast that mDNS
+> depends on. This was confirmed during development: unicast worked while a raw
+> mDNS query got no reply at all.
+>
+> If `keychain-nas.local` does not resolve, join the same SSID as the device, or
+> use the IP fallback documented at each step below.
 
 ---
 
@@ -21,11 +35,15 @@ STEP 2, mount the drive:      net use Z: https://<board-ip>/ *
 **Open this in any browser:**
 
 ```
-http://<board-ip>/ca.crt
+http://keychain-nas.local/ca.crt
 ```
 
 Save the file. That is the whole step. No flags, no GitHub, no USB stick — the
 device serves its own certificate over plain HTTP for exactly this purpose.
+
+If that name does not resolve, use the address from the boot log instead —
+`http://<board-ip>/ca.crt` — and see
+[mDNS does not resolve](#keychain-naslocal-does-not-resolve).
 
 It downloads as `ca.crt` (652 bytes, beginning `-----BEGIN CERTIFICATE-----`).
 Most browsers will offer to save or install it rather than displaying it,
@@ -129,17 +147,21 @@ warning is about CA certificates in general.
 ### Windows
 
 ```bash
-net use Z: https://<board-ip>/ *
+net use Z: https://keychain-nas.local/ *
 ```
 
 The `*` makes it prompt for the password. To pass credentials directly:
 
 ```bash
-net use Z: https://<board-ip>/ /user:your-webdav-username your-webdav-password
+net use Z: https://keychain-nas.local/ /user:your-webdav-username your-webdav-password
 ```
 
-Via the GUI: *This PC* → *Map Network Drive* → `https://<board-ip>/` → tick
-**Connect using different credentials**.
+Via the GUI: *This PC* → *Map Network Drive* → `https://keychain-nas.local/` →
+tick **Connect using different credentials**.
+
+Using the hostname is what makes the mapping survive a DHCP change. A mapping
+made against a raw IP breaks silently the next time the lease moves — it stays
+listed in `net use` while being unreachable.
 
 > [!NOTE]
 > The username and password are the `WEBDAV_USER` / `WEBDAV_PASS` pair from the
@@ -177,6 +199,45 @@ curl --cacert ca.crt -u your-webdav-username https://<board-ip>/test.md
 ---
 
 ## If something goes wrong
+
+### `keychain-nas.local` does not resolve
+
+Symptoms: `ping keychain-nas.local` says the host could not be found, and
+browsers hang or fail immediately.
+
+**Most likely cause: your client and the device are on different WiFi networks.**
+The ESP32-S3 is 2.4 GHz only. If your laptop is on a 5 GHz SSID — even one from
+the same router, where the two SSIDs differ only by a `_5G` style suffix —
+normal traffic is usually routed between them but multicast often is not, and
+mDNS is built entirely on multicast.
+
+This is not hypothetical. During development, from a laptop on the 5 GHz SSID:
+
+- `https://<board-ip>/status` returned **200** — unicast fine
+- a raw mDNS query to `224.0.0.251:5353` got **no response at all**
+
+To confirm it is the network rather than your machine, run the same raw query
+yourself. On Linux or macOS:
+
+```bash
+dig +short @224.0.0.251 -p 5353 keychain-nas.local
+```
+
+Fixes, in order of preference:
+
+1. **Join the same SSID as the device** — the 2.4 GHz one. This is the real fix.
+2. **Use the IP address** from the boot log as a fallback. It works, but breaks
+   whenever the lease changes, which is the problem mDNS exists to solve.
+3. **Reserve the address** on your router (bind it to the board's MAC) so the IP
+   at least stops moving.
+
+Other causes worth checking if you are on the same SSID:
+
+- **AP isolation / guest mode** on the router blocks client-to-client traffic
+  including multicast
+- **Windows network profile set to Public** — mDNS is blocked there. Check with
+  `Get-NetConnectionProfile`; it should say `Private`
+- **Mesh systems and VLANs** frequently drop multicast between nodes
 
 ### `System error 1790` / "The network logon failed"
 
