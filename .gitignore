@@ -1,0 +1,29 @@
+# --- Secrets: never commit these ---
+# WiFi password and WebDAV login. Only wifi_credentials.h.example is tracked.
+main/wifi_credentials.h
+
+# TLS keypair. Kept as files rather than inside wifi_credentials.h because
+# EMBED_TXTFILES needs real files on disk to embed.
+#
+# The whole directory is excluded, not just the key. server.crt is not secret in
+# itself, but it is useless without the key, and its subjectAltName embeds the
+# local IP it was issued for. Generate your own pair with tools/gencert.py.
+main/certs/
+
+# --- ESP-IDF build output ---
+# build/ contains the linked binary, which has the WiFi password embedded as a
+# plain string, plus build/config/sdkconfig.h. Keep it out of the repo.
+build/
+sdkconfig
+sdkconfig.old
+
+# --- Managed components (restored by idf.py reconfigure) ---
+managed_components/
+dependencies.lock
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
