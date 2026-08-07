@@ -304,6 +304,89 @@ static bool is_hidden_junk(const char *name)
   return false;
 }
 
+/* ---------------------------------------------------------------------------
+   ETags
+
+   Clients that edit-and-save need a validator: they GET a file with an ETag,
+   then PUT it back with If-Match so a concurrent change is detected rather than
+   silently clobbered. With no ETag to condition on, several clients refuse the
+   write outright rather than risk losing someone else's edit -- which is the
+   safe choice on their part, and looked like a read-only filesystem from the
+   outside.
+
+   mtime+size is sufficient here. It need not be cryptographic: this is a
+   single-writer device, and the only requirement is that the value changes
+   whenever the file does.
+   --------------------------------------------------------------------------- */
+
+/* Writes a quoted entity-tag, e.g. "5f2a1c-3e8". Quotes are part of the value
+   per RFC 9110 and clients echo them back verbatim. */
+static void compute_etag(const struct stat *st, char *out, size_t out_len)
+{
+  snprintf(out, out_len, "\"%llx-%llx\"",
+           (unsigned long long)st->st_mtime,
+           (unsigned long long)st->st_size);
+}
+
+/* Does an If-Match / If-None-Match header value select this etag?
+   Handles "*", a single tag, and a comma-separated list. Weak prefixes (W/)
+   are tolerated by matching on the quoted portion. */
+static bool etag_list_matches(const char *header, const char *etag)
+{
+  while (*header == ' ') {
+    header++;
+  }
+  if (header[0] == '*' ) {
+    return true;
+  }
+  /* Substring search is adequate: etag is quoted, so it cannot match a partial
+     token in the list. */
+  return strstr(header, etag) != NULL;
+}
+
+/* Evaluates If-Match and If-None-Match against the current state of a resource.
+   Returns true if the request may proceed; on false the response has already
+   been sent. `exists` and `st` describe the target before the operation. */
+static bool preconditions_ok(httpd_req_t *req, bool exists, const struct stat *st)
+{
+  char etag[48] = "";
+  if (exists) {
+    compute_etag(st, etag, sizeof(etag));
+  }
+
+  char hdr[192];
+
+  /* If-None-Match: "*" means "only if it does not already exist" -- how clients
+     express create-but-do-not-overwrite. */
+  if (httpd_req_get_hdr_value_str(req, "If-None-Match", hdr, sizeof(hdr)) == ESP_OK) {
+    ESP_LOGI(TAG, "If-None-Match: %s (current %s)", hdr, exists ? etag : "<absent>");
+    if (exists && etag_list_matches(hdr, etag)) {
+      httpd_resp_set_status(req, "412 Precondition Failed");
+      httpd_resp_send(req, NULL, 0);
+      return false;
+    }
+  }
+
+  if (httpd_req_get_hdr_value_str(req, "If-Match", hdr, sizeof(hdr)) == ESP_OK) {
+    ESP_LOGI(TAG, "If-Match: %s (current %s)", hdr, exists ? etag : "<absent>");
+    /* If-Match on something that no longer exists always fails. */
+    if (!exists || !etag_list_matches(hdr, etag)) {
+      httpd_resp_set_status(req, "412 Precondition Failed");
+      httpd_resp_send(req, NULL, 0);
+      return false;
+    }
+  }
+
+  /* The WebDAV If: header carries lock state tokens. We do not enforce locks
+     (see the LOCK section), but log it so client behaviour is visible in the
+     serial trace during diagnosis. */
+  if (httpd_req_get_hdr_value_str(req, "If", hdr, sizeof(hdr)) == ESP_OK) {
+    ESP_LOGI(TAG, "If: %s", hdr);
+  }
+
+  return true;
+}
+
 /* RFC 1123 date, which is what getlastmodified must carry. */
 static void http_date(time_t t, char *out, size_t out_len)
 {
@@ -345,6 +428,12 @@ static esp_err_t send_response_block(httpd_req_t *req, const char *href_path,
   char datebuf[40];
   http_date(mtime, datebuf, sizeof(datebuf));
 
+  /* Same derivation as compute_etag() -- kept consistent so the value a client
+     reads from PROPFIND is the one it can later send back in If-Match. */
+  char etag[48];
+  snprintf(etag, sizeof(etag), "\"%llx-%llx\"",
+           (unsigned long long)mtime, (unsigned long long)size);
+
   char *buf = malloc(DAV_SCRATCH + DAV_MAX_PATH);
   if (!buf) {
     return ESP_ERR_NO_MEM;
@@ -373,12 +462,13 @@ static esp_err_t send_response_block(httpd_req_t *req, const char *href_path,
                    "<D:resourcetype/>"
                    "<D:getcontentlength>%ld</D:getcontentlength>"
                    "<D:getlastmodified>%s</D:getlastmodified>"
+                   "<D:getetag>%s</D:getetag>"
                    "<D:getcontenttype>application/octet-stream</D:getcontenttype>"
                    "</D:prop>"
                    "<D:status>HTTP/1.1 200 OK</D:status>"
                    "</D:propstat>"
                    "</D:response>",
-                   href_path, (long)size, datebuf);
+                   href_path, (long)size, datebuf, etag);
   }
 
   esp_err_t err = ESP_OK;
@@ -545,6 +635,11 @@ static esp_err_t dav_get_handler(httpd_req_t *req)
 
   ESP_LOGI(TAG, "GET %s (%ld bytes)", req->uri, (long)st.st_size);
 
+  /* The validator a client needs in order to write this file back safely. */
+  char etag[48];
+  compute_etag(&st, etag, sizeof(etag));
+  httpd_resp_set_hdr(req, "ETag", etag);
+
   /* .md is served as text/plain so a browser shows it rather than downloading;
      everything else is opaque bytes. */
   const char *dot = strrchr(fs_path, '.');
@@ -674,6 +769,13 @@ static esp_err_t dav_put_handler(httpd_req_t *req)
     return ESP_FAIL;
   }
 
+  /* Evaluated before the file is opened: opening with "wb" truncates, so a
+     failed precondition must be caught while the old contents still exist. */
+  if (!preconditions_ok(req, existed, &st)) {
+    ESP_LOGW(TAG, "PUT %s -> 412 precondition failed", req->uri);
+    return ESP_OK;
+  }
+
   FILE *f = fopen(fs_path, "wb");
   if (!f) {
     ESP_LOGE(TAG, "PUT %s -> cannot open for writing", fs_path);
@@ -719,6 +821,15 @@ static esp_err_t dav_put_handler(httpd_req_t *req)
   free(buf);
   fclose(f);
   ESP_LOGI(TAG, "PUT %s (%d bytes)", req->uri, total);
+
+  /* Hand back the validator for the version just written, so a client can chain
+     further edits without a round trip to re-read it. */
+  struct stat post;
+  if (stat(fs_path, &post) == 0) {
+    char etag[48];
+    compute_etag(&post, etag, sizeof(etag));
+    httpd_resp_set_hdr(req, "ETag", etag);
+  }
 
   /* 201 for a new resource, 204 when overwriting an existing one. */
   httpd_resp_set_status(req, existed ? "204 No Content" : "201 Created");
@@ -785,6 +896,11 @@ static esp_err_t dav_delete_handler(httpd_req_t *req)
   if (stat(fs_path, &st) != 0) {
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
     return ESP_FAIL;
+  }
+
+  if (!preconditions_ok(req, true, &st)) {
+    ESP_LOGW(TAG, "DELETE %s -> 412 precondition failed", req->uri);
+    return ESP_OK;
   }
 
   if (!remove_recursive(fs_path)) {
@@ -981,6 +1097,11 @@ static esp_err_t dav_head_handler(httpd_req_t *req)
   char len[24];
   snprintf(len, sizeof(len), "%ld", (long)st.st_size);
   httpd_resp_set_hdr(req, "Content-Length", len);
+
+  char etag[48];
+  compute_etag(&st, etag, sizeof(etag));
+  httpd_resp_set_hdr(req, "ETag", etag);
+
   httpd_resp_set_type(req, "application/octet-stream");
   httpd_resp_set_status(req, "200 OK");
 
