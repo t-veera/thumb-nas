@@ -46,6 +46,7 @@
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 #include "webdav.h"
+#include "cacert_server.h"
 
 static const char *TAG = "waveshare_test";
 
@@ -117,7 +118,13 @@ static bool wifi_init_sta(void) {
 
   ESP_LOGI(TAG, "Connecting to %s ...", WIFI_SSID);
 
-  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+  /* This timeout must outlast the retry budget above, or it fires first and we
+     give up while the connection is still in progress. Ten retries at roughly
+     2.4s each is ~24s, so a 20s timeout used to lose the race on a weak
+     signal: app_main returned without starting any server, and the IP then
+     arrived a second later, leaving the board reachable but serving nothing.
+     WIFI_FAIL_BIT is the intended failure path; this is only a backstop. */
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(60000));
 
   if (bits & WIFI_CONNECTED_BIT) {
     ESP_LOGI(TAG, "Connected to %s", WIFI_SSID);
@@ -212,8 +219,16 @@ void app_main(void) {
     esp_netif_get_ip_info(netif, &ip_info);
 
     ESP_LOGI(TAG, "--------------------------------------------------");
-    ESP_LOGI(TAG, "Fetch the test file at:  http://" IPSTR "/test.md", IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "STEP 1, get the certificate:  http://" IPSTR "/ca.crt", IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "STEP 2, mount the drive:      net use Z: https://" IPSTR "/ *",
+             IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "Or fetch a file directly:     curl --cacert ca.crt -u %s https://" IPSTR "/test.md",
+             WEBDAV_USER, IP2STR(&ip_info.ip));
     ESP_LOGI(TAG, "--------------------------------------------------");
+
+    /* Started regardless of the SD card: a client still needs the CA to reach
+       the HTTPS server at all, and this listener never touches /sdcard. */
+    cacert_server_start();
 
     if (sd_ok) {
       webdav_start(MOUNT_POINT);

@@ -1,0 +1,25 @@
+# Partition table for thumb-nas.
+#
+# The board carries 32MB of flash (GigaDevice c8:4019, confirmed with
+# `esptool flash_id`). The stock partitions_singleapp.csv sizes its app
+# partition from whatever CONFIG_ESPTOOLPY_FLASHSIZE claims, so a stale "2MB"
+# setting produced a 1MB app partition that WebDAV + TLS + auth had filled to
+# 94%. This table sizes the app deliberately instead.
+#
+# No OTA partitions: this device is reflashed over USB by hand, so a second
+# app bank would only cost space. Adding OTA later means resizing here.
+#
+# Layout (offsets are absolute; the table itself lives at 0x8000):
+#   0x009000   24K  nvs        WiFi calibration + any future key/value data
+#   0x00f000    4K  phy_init   RF calibration
+#   0x010000    4M  factory    the application
+#   0x410000  ~27M  (unallocated -- free for a future data partition; adding
+#                    one here does not move anything above it)
+#
+# Bulk storage is the SD card, not flash, so no SPIFFS/LittleFS partition is
+# defined. 4MB of app space is roughly 4x the current binary.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x400000,

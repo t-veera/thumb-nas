@@ -41,7 +41,10 @@ On boot the firmware:
 1. Mounts the TF card over SPI at `/sdcard`
 2. Writes a small `test.md` to it
 3. Joins WiFi as a station
-4. Prints its IP address and starts a WebDAV server on port 443
+4. Prints its IP address, then starts two listeners:
+   - **port 443** — the WebDAV server, TLS + password required
+   - **port 80** — serves only `GET /ca.crt`, so a new client can bootstrap
+     trust. Nothing else is reachable there.
 
 Supported methods: `OPTIONS`, `PROPFIND`, `PROPPATCH`, `GET`, `HEAD`, `PUT`,
 `DELETE`, `MKCOL`, `MOVE`, `LOCK`, `UNLOCK`. Announced as DAV class 2.
@@ -160,14 +163,29 @@ delete `sdkconfig` and rebuild after editing them.
 
 Take the IP address from the boot log. Examples below use `<board-ip>`.
 
-### Step 1 — trust the CA (once per client machine)
+> [!TIP]
+> Client-side instructions live in **[SETUP.md](SETUP.md)** — that is the file
+> to hand to anyone who just wants to use the drive.
+
+### Step 1 — get the CA from the device, and trust it (once per client machine)
 
 Because the certificate is issued by your own CA rather than a public one,
 **every machine that mounts the drive must be told to trust `ca.crt` first.**
 There is no way around this short of owning a public domain name. Windows will
 refuse to mount with `System error 1790` until you do.
 
-**Windows** — in an **Administrator** prompt:
+The device serves its own certificate for this purpose. Open it in any browser,
+no flags and no prior trust required, and save the file:
+
+```
+http://<board-ip>/ca.crt
+```
+
+That is a separate plain-HTTP listener on port 80 which serves **only** that one
+path — see [Certificate distribution](#certificate-distribution) for why it is
+unencrypted and why it cannot reach the SD card.
+
+Then trust it. **Windows** — in an **Administrator** prompt:
 
 ```bash
 certutil -addstore -f "Root" path\to\ca.crt
@@ -467,9 +485,38 @@ refused.
 
 What this protects against, and what it does not.
 
-**Transport is TLS-only.** There is no plain-HTTP listener. Basic auth sends
-credentials as base64, which is reversible, so it is only defensible underneath
-TLS.
+**File access is TLS-only.** Basic auth sends credentials as base64, which is
+reversible, so it is only defensible underneath TLS.
+
+### Certificate distribution
+
+There is exactly one plain-HTTP endpoint: `GET /ca.crt` on port 80.
+
+It exists because a client that does not yet hold the CA cannot complete a TLS
+handshake, and therefore cannot use HTTPS to fetch the thing it needs in order
+to use HTTPS. Something has to break that circle.
+
+Serving it unencrypted discloses nothing. `ca.crt` is the *public* half of the
+certificate — the device already presents it to every client during every TLS
+handshake.
+
+It is confined by construction, not by convention:
+
+- a **separate `httpd` instance** in its own translation unit
+  (`cacert_server.c`), so it cannot inherit a WebDAV handler by accident
+- `max_uri_handlers = 1` and `uri_match_fn = NULL`, so matching is exact and
+  there is no wildcard route to fall through to
+- one registered route, `GET /ca.crt`. Nothing else is reachable, and it never
+  touches `/sdcard`
+
+Verified on hardware: `/`, `/test.md`, `/algoarts`, `/server.key`, `/ca.key` and
+`/ca.crt/../test.md` all return 404, and `PUT`/`DELETE`/`PROPFIND` on `/ca.crt`
+return 405.
+
+The residual risk is trust-on-first-use: someone on-path during that single
+unencrypted fetch could substitute their own CA. Everything afterwards is
+protected. Fetch it on a network you trust, or verify the fingerprint out of
+band.
 
 **The certificate is a two-cert chain, deliberately.** A single self-signed
 certificate has to be marked `CA=TRUE` to be trusted, and installing that into a
@@ -562,9 +609,11 @@ up its own AP if that fails. With mDNS the address stays stable in both modes.
 ```
 thumb-nas/
 ├── CMakeLists.txt                     Top-level IDF project file
-├── sdkconfig.defaults                 Tracked build settings (FAT LFN, HTTPS)
+├── partitions.csv                     4MB app partition out of the 32MB chip
+├── sdkconfig.defaults                 Tracked build settings (flash size, LFN, HTTPS)
 ├── .gitignore                         Excludes credentials, certs, build output
-├── README.md
+├── README.md                          This file — how it works, how it was built
+├── SETUP.md                           Client-side instructions for end users
 ├── tools/
 │   └── gencert.py                     Generates the constrained CA and leaf
 └── main/
@@ -572,6 +621,8 @@ thumb-nas/
     ├── main.c                         SD mount, WiFi, startup
     ├── webdav.c                       Auth, WebDAV handlers, TLS server start
     ├── webdav.h
+    ├── cacert_server.c                Plain-HTTP CA distribution, one route only
+    ├── cacert_server.h
     ├── certs/                         Generated TLS material — gitignored
     ├── wifi_credentials.h             Your secrets — gitignored
     └── wifi_credentials.h.example     Tracked template

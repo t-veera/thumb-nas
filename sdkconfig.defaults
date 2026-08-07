@@ -12,6 +12,17 @@ CONFIG_FATFS_MAX_LFN=255
 # survive the round trip through WebDAV.
 CONFIG_FATFS_API_ENCODING_UTF_8=y
 
+# --- Flash size and partitioning ---
+# The chip is 32MB (GigaDevice c8:4019, confirmed via `esptool flash_id`).
+# This was previously left at ESP-IDF's 2MB default, which capped the app
+# partition at 1MB -- the real cause of the "94% full" warning, not capacity.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+
+# Custom table: single 4MB app, no OTA. See partitions.csv for the layout.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # --- HTTPS ---
 # Depends on ESP_TLS_USING_MBEDTLS and MBEDTLS_TLS_SERVER, both default y.
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
